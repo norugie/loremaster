@@ -46,11 +46,16 @@ models:
 retrieval:
   min_score: 0.70
 
-# Optional: the franchise your setting is based on. When set, and no note is
-# relevant to a question, the bot answers from the answer model's own knowledge
-# of that canon (listing no notes). Your notes always win when they cover the
-# question. Leave it out to answer from your notes only. Small models know
-# little canon and can get it wrong.
+# Optional: a wiki to search when no note is relevant to a question. It must
+# run MediaWiki (most fan wikis do); give the full address of its api.php. The
+# bot answers only from the wiki's text and links the pages it used. Your notes
+# always win when they cover the question. Leave it out to answer from your
+# notes only. Check that the wiki's terms allow automated requests.
+# wiki:
+#   api_url: https://wiki.example.org/api.php
+
+# Optional: the franchise your setting is based on. Only used to tell the
+# model what the wiki is about; it has no effect without a wiki.
 # canon: Name of the franchise
 
 # Optional: /lore update, a staff command that adds or changes lore in the

@@ -49,7 +49,7 @@ Discord: /lore ask <question>
 [6] Retrieve ── embed the question; top 5 chunks by cosine similarity
   │
   ├─ best score < retrieval.min_score ──▶ "not found in the lore"
-  │                                       (or a canon answer, if canon is set)
+  │                                       (or the wiki fallback, if wiki is set)
   ▼
 [7] Prompt ── rules + guidance note, then the chunks (with note names) + question
   │
@@ -70,6 +70,19 @@ Each question stands alone: there is no conversation memory. The vault is only r
 - **Length-1 vectors.** Vectors are scaled to length 1 when stored, so a plain dot product is the cosine similarity.
 - **A score threshold decides "not found".** Below `retrieval.min_score` (default 0.70) no note counts as relevant, and the model isn't called.
 - **Small prompt.** The context is 2,048 tokens, because GPU memory grows with it: at most 4,500 characters of notes, answers up to 350 tokens, temperature 0.3.
+
+### Wiki fallback (optional)
+
+Used only when no note is relevant and the config has a `wiki` block. The model never answers from its own knowledge: a 4B model invents canon.
+
+- **Search.** One request to the wiki's MediaWiki API (`generator=search`) returns the three best article titles with their URLs, plus the wiki's name and license.
+- **Fetch and clean.** Each page is fetched as rendered HTML (`action=parse`), one request at a time, and turned into plain-text sections by heading with the standard library's `html.parser`. Rendered HTML is used rather than wikitext because templates and infoboxes are already expanded, on any wiki.
+- **Rank.** The sections are embedded and scored against the question like vault chunks, with the same `retrieval.min_score` and the same prompt budget. The wiki's own search matches keywords; this step judges meaning.
+- **Pages the question names.** The search request also returns each page's redirects. If the question contains a page's title or a redirect to it as whole words, that page's sections go first and skip the score threshold. The embedding model can't know that a nickname or number and the real title mean the same thing; the wiki's redirects do.
+- **Answer.** The model gets the relevant sections as "Wiki excerpts" with rules to use only them. The reply says "Not in the server lore" and credits the wiki, its license and the pages used, with links.
+- **Nothing relevant, or the wiki fails:** "not found", and the model isn't called.
+- **Politeness.** At most four requests per new question, in series, with a 5-second timeout and a 2 MB cap each, gzip, and a User-Agent naming the bot. Searches and pages (with their vectors) are cached in memory for 24 hours, up to 100 each.
+- **Trust.** Wiki text is untrusted. It only ever reaches the prompt as excerpts; the bot requests only the configured `api.php`; links are shown only if they point at that wiki.
 
 ### Keeping the index current
 
@@ -108,6 +121,7 @@ loremaster/
 │       ├── index.py              # steps [3]+[4] embed, store, sync
 │       ├── watcher.py            # re-index on vault file changes
 │       ├── retrieve.py           # step [6] cosine similarity search
+│       ├── wiki.py               # wiki fallback: search, fetch, clean, rank, cache
 │       ├── answer.py             # steps [7]+[8] prompt, model call
 │       ├── update.py             # /lore update: propose and write; the only writer
 │       └── bot.py                # step [5] and the Discord layer
@@ -142,6 +156,7 @@ Start: `docker compose up -d bot`. Log: `docker compose logs -f bot`. Stop: `doc
 | `python -m loremaster.watcher` | Sync the index once, then watch the vault (no Discord token needed). |
 | `python -m loremaster.retrieve "a question"` | Print the top chunks and scores (`-k`, `--text`). |
 | `python -m loremaster.answer "a question"` | Print the answer, the notes used and the scores (`--prompt`). |
+| `python -m loremaster.wiki "a question"` | Print the wiki sections found and their scores (`-k`, `--text`). |
 
 From Git Bash, prefix commands that pass `/vault` with `MSYS_NO_PATHCONV=1`, or Git Bash rewrites the path. PowerShell doesn't need this.
 
@@ -174,7 +189,7 @@ Both are subcommands of one `/lore` command, so Discord's default permissions ap
 ## 7. Reliability
 
 - One bad input never stops the bot: a note with broken frontmatter is logged and skipped; a failed question is logged and gets a short error reply, and the next question still works.
-- Timeouts: every Ollama call (answer and embedding) gives up after 120 s instead of hanging.
+- Timeouts: every Ollama call (answer and embedding) gives up after 120 s instead of hanging. Every wiki request gives up after 5 s; a wiki failure becomes a "not found" reply, not an error.
 - A note caught half-written or locked keeps its previous version in the index and is retried once after 2 s. Saves are batched (500 ms), so both in-place writes and temp-file-then-rename saves give one sync.
 - `/lore update` never half-writes a note: backup first, temp file, then one replace. Any failure leaves the note as it was.
 - Config is validated once at start-up and fails fast with a message naming the bad value. With `/lore update` on, the vault must be writable or the bot refuses to start.
@@ -201,7 +216,8 @@ Targets: **median < 3 s, worst < 15 s** from question to answer, and **about 3 G
 | RAG framework | None: built by hand | LangChain, LlamaIndex | Every step stays visible, and fewer dependencies. The cost is more code to write and test. |
 | Vaults per bot | One vault, any number of servers, none listed in config | One server per bot; listing servers | Several servers can share one setting's vault, and new servers need no config change. |
 | Re-indexing | On file change, per note | On a command or restart only | Staff update lore by editing the vault; no admin commands needed. |
-| Canon knowledge | Fallback when no notes are relevant | Vault only; mixing canon into vault answers | Settings based on a franchise rely on canon the vault doesn't repeat. Risk: a 4B model can get canon wrong. |
+| Canon knowledge | A configured wiki, searched when no notes are relevant | The model's own knowledge; canon notes in the vault; a downloaded wiki dump | Settings based on a franchise rely on canon the vault doesn't repeat. The 4B model invented canon when asked from memory. Costs: answers depend on the wiki's keyword search and on the wiki being reachable. |
+| Wiki HTTP client | `urllib.request` (standard library) | `httpx`, `aiohttp` | No new dependency for four GET requests; it blocks, but answering already runs in a worker thread. |
 | `/lore update` | Edits the vault directly, staff role only | Draft notes for review; posting suggestions to a staff channel | Changes go live at once. Risk: no review; guarded by staff roles, a preview, a backup, and writing only inside the vault. |
 | Rate limit | 15 s cooldown, per server | Per member; per channel; none | Protects the shared GPU. |
 | Where it runs | Docker container | Natively with uv and a `.venv` | No Python setup on the PC. The costs: file watching has to poll, syncs over the mount are slower, and VS Code needs the Dev Containers extension. |
@@ -216,4 +232,5 @@ Targets: **median < 3 s, worst < 15 s** from question to answer, and **about 3 G
 - Installed package sources: `ollama` 0.6.3 (`Client.embed`, `OLLAMA_HOST`), watchfiles 1.3.0 (`awatch`, `Change`, `WATCHFILES_FORCE_POLLING`, `WATCHFILES_POLL_DELAY_MS`).
 - docs.discord.com (oauth2, gateway, application commands, receiving and responding): scopes, intents, the 3-second reply rule, the 15-minute interaction token.
 - Docker: `python:3.15-slim` checked with `docker manifest inspect` and run (Python 3.15.2, glibc 2.41, SQLite 3.46); container-to-host Ollama checked at `host.docker.internal:11434`; bind-mount events checked on a temp folder (none natively; polling works).
+- MediaWiki Action API (checked 2026-11-14): mediawiki.org `API:Etiquette` (requests in series, a descriptive User-Agent, gzip) and `API:Search`; `generator=search` with `prop=info&inprop=url` and `meta=siteinfo`, and `action=parse&prop=text`, tried against a live MediaWiki 1.43 wiki. `prop=extracts` is an extension that not every wiki has, so it isn't used.
 - Obsidian save behaviour: forum.obsidian.md/t/atomic-file-writes/56065 (a feature request, not an official statement), plus watchfiles events observed on Windows 11 for in-place writes, temp-file-then-replace saves and renames.

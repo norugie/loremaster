@@ -378,3 +378,21 @@ def test_format_reply_keeps_question_and_notes_when_cutting() -> None:
     assert len(reply) <= 2000
     assert reply.startswith("> " + "q" * 300 + "\n")
     assert reply.endswith("…\n-# Notes: Bakery")
+
+
+# A wiki answer says it isn't server lore and credits and links the pages.
+def test_format_reply_credits_the_wiki() -> None:
+    wiki_answer = Answer(
+        text="word " * 1000,
+        notes=(),
+        hits=(),
+        found=False,
+        sources=(("Harbor [Guild]", "https://wiki.example/wiki/Harbor_(Guild)"),),
+        credit="Made-Up Wiki (CC BY-SA)",
+    )
+    reply = format_reply(wiki_answer, "q")
+    assert len(reply) <= 2000
+    assert reply.endswith(
+        "…\n-# Not in the server lore. From Made-Up Wiki (CC BY-SA): "
+        "[Harbor \\[Guild\\]](<https://wiki.example/wiki/Harbor_(Guild)>)"
+    )

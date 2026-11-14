@@ -7,6 +7,7 @@ bag-of-words fake embedder, so no Ollama is needed. The test marked
 
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -14,10 +15,10 @@ from loremaster.answer import (
     NOT_FOUND_TEXT,
     NOTES_CHAR_BUDGET,
     SYSTEM_RULES,
+    WIKI_DOWN_TEXT,
     Answerer,
     Message,
     OllamaChat,
-    build_canon_messages,
     build_messages,
     load_guidance,
     note_names,
@@ -35,6 +36,7 @@ from loremaster.config import (
 )
 from loremaster.index import IndexSettings, IndexStore, OllamaEmbedder, sync_index
 from loremaster.retrieve import Hit, Retriever
+from loremaster.wiki import Wiki, WikiError, WikiResult
 from tests.test_retrieve import NOTES, WordsEmbedder, build
 
 FIXTURE_VAULT = Path(__file__).parent / "fixtures" / "vault"
@@ -331,48 +333,106 @@ def test_default_min_score(tmp_path: Path) -> None:
     assert load_config(_config(tmp_path, "guidance.md")).retrieval.min_score == 0.70
 
 
-# --- canon fallback ----------------------
+# --- wiki fallback ----------------------
 
 
-def test_canon_prompt_names_the_canon_and_has_no_notes() -> None:
-    messages = build_canon_messages(" Who is the hero? ", "Made-Up Saga", "Be kind.")
-    system, user = messages[0]["content"], messages[1]["content"]
-    assert "Made-Up Saga" in system and "{canon}" not in system
-    assert "say you don't know" in system
-    assert "Be kind." in system  # guidance is in every prompt
-    assert user == "Question: Who is the hero?"
-    assert "Notes:" not in user
+class FakeWiki:
+    """Stands in for `Wiki`: returns fixed sections, or fails."""
+
+    def __init__(
+        self, hits: list[Hit], fail: bool = False, named: Sequence[str] = ()
+    ) -> None:
+        self.hits = hits
+        self.fail = fail
+        self.named = frozenset(named)
+        self.questions: list[str] = []
+
+    def search(self, question: str) -> WikiResult:
+        self.questions.append(question)
+        if self.fail:
+            raise WikiError("timed out")
+        urls = {
+            h.chunk.title: f"https://wiki.example/{h.chunk.title}" for h in self.hits
+        }
+        return WikiResult(self.hits, urls, "Made-Up Wiki (CC BY-SA)", self.named)
 
 
-# Canon on + nothing relevant -> the model answers from canon, no notes.
-def test_canon_fallback_when_nothing_is_relevant(tmp_path: Path) -> None:
-    chat = FakeChat("The hero is Brightblade.")
-    bot = answerer(tmp_path, chat)
-    bot.min_score, bot.canon = 0.7, "Made-Up Saga"
-    result = bot.answer("Who is the hero?", [hit("A", "unrelated", 0.4)])
-    assert result.text == "The hero is Brightblade."
-    assert result.notes == ()
-    assert not result.found
-    assert "Made-Up Saga" in chat.prompts[0][0]["content"]
-    assert "unrelated" not in chat.prompts[0][1]["content"]
-
-
-# Canon on + relevant notes -> the notes prompt, not the canon prompt.
-def test_notes_win_over_canon(tmp_path: Path) -> None:
-    chat = FakeChat()
-    bot = answerer(tmp_path, chat)
-    bot.min_score, bot.canon = 0.7, "Made-Up Saga"
-    result = bot.answer("Who is the hero?", [hit("Heroes", "The hero is Ash.", 0.8)])
-    assert result.found and result.notes == ("Heroes",)
-    assert chat.prompts[0][0]["content"] == SYSTEM_RULES
-    assert "Made-Up Saga" not in "\n".join(m["content"] for m in chat.prompts[0])
-
-
-# No canon configured -> vault only (not found, model not called).
-def test_no_canon_means_vault_only(tmp_path: Path) -> None:
-    chat = FakeChat()
+def wiki_answerer(tmp_path: Path, chat: FakeChat, wiki: FakeWiki) -> Answerer:
     bot = answerer(tmp_path, chat)
     bot.min_score = 0.7
+    # FakeWiki has Wiki's one public method; a cast keeps the test simple.
+    bot.wiki = cast(Wiki, wiki)
+    return bot
+
+
+# No relevant note + relevant wiki sections -> answered from them, with sources.
+def test_wiki_answers_when_no_note_is_relevant(tmp_path: Path) -> None:
+    chat = FakeChat("The hero is Brightblade.")
+    wiki = FakeWiki(
+        [hit("Heroes", "Brightblade is the hero.", 0.8), hit("B", "x", 0.3)]
+    )
+    bot = wiki_answerer(tmp_path, chat, wiki)
+    bot.canon = "Made-Up Saga"
+    result = bot.answer("Who is the hero?", [hit("A", "unrelated", 0.4)])
+    assert result.text == "The hero is Brightblade."
+    assert result.notes == () and not result.found
+    assert result.sources == (("Heroes", "https://wiki.example/Heroes"),)
+    assert result.credit == "Made-Up Wiki (CC BY-SA)"
+    system, user = (m["content"] for m in chat.prompts[0])
+    assert "a wiki about Made-Up Saga" in system
+    assert "Use only facts stated in the excerpts" in system
+    assert user.startswith("Wiki excerpts:\n\n[1] Heroes\nBrightblade is the hero.")
+    assert "unrelated" not in user and "[2]" not in user
+
+
+# A page the question names is used even though its text scores low.
+def test_a_named_wiki_page_is_used_whatever_it_scores(tmp_path: Path) -> None:
+    chat = FakeChat("It is the ninth book.")
+    wiki = FakeWiki(
+        [hit("The Ninth Book", "The ninth book.", 0.5), hit("B", "x", 0.6)],
+        named=["The Ninth Book"],
+    )
+    result = wiki_answerer(tmp_path, chat, wiki).answer("What is Book 9?", [])
+    assert result.sources == (
+        ("The Ninth Book", "https://wiki.example/The Ninth Book"),
+    )
+    assert "[2]" not in chat.prompts[0][1]["content"]
+
+
+# Relevant notes -> the notes prompt; the wiki isn't asked.
+def test_notes_win_over_the_wiki(tmp_path: Path) -> None:
+    chat = FakeChat()
+    wiki = FakeWiki([hit("Heroes", "wiki text", 0.9)])
+    bot = wiki_answerer(tmp_path, chat, wiki)
+    result = bot.answer("Who is the hero?", [hit("Heroes", "The hero is Ash.", 0.8)])
+    assert result.found and result.notes == ("Heroes",) and result.sources == ()
+    assert chat.prompts[0][0]["content"] == SYSTEM_RULES
+    assert wiki.questions == []
+
+
+# Nothing relevant on the wiki either -> not found, model not called.
+def test_wiki_with_nothing_relevant_says_not_found(tmp_path: Path) -> None:
+    chat = FakeChat()
+    bot = wiki_answerer(tmp_path, chat, FakeWiki([hit("B", "x", 0.5)]))
+    result = bot.answer("q", [])
+    assert result.text == NOT_FOUND_TEXT and result.sources == ()
+    assert chat.prompts == []
+
+
+# Wiki out of reach -> not found (saying so), model not called, no error.
+def test_wiki_failure_says_not_found(tmp_path: Path) -> None:
+    chat = FakeChat()
+    bot = wiki_answerer(tmp_path, chat, FakeWiki([], fail=True))
+    result = bot.answer("q", [])
+    assert result.text == NOT_FOUND_TEXT + WIKI_DOWN_TEXT
+    assert chat.prompts == []
+
+
+# A canon name alone never makes the model answer from its own knowledge.
+def test_canon_without_wiki_means_vault_only(tmp_path: Path) -> None:
+    chat = FakeChat()
+    bot = answerer(tmp_path, chat)
+    bot.min_score, bot.canon = 0.7, "Made-Up Saga"
     assert bot.answer("q", [hit("A", "a", 0.4)]).text == NOT_FOUND_TEXT
     assert chat.prompts == []
 
@@ -385,3 +445,25 @@ def test_canon_comes_from_config(tmp_path: Path) -> None:
     path.write_text(path.read_text().replace("Made-Up Saga", '""'))
     with pytest.raises(ConfigError, match="canon"):
         load_config(path)
+
+
+def test_wiki_comes_from_config(tmp_path: Path) -> None:
+    path = _config(tmp_path, "guidance.md")
+    assert load_config(path).wiki is None
+    base = path.read_text()
+    path.write_text(base + "wiki:\n  api_url: https://wiki.example/w/api.php\n")
+    wiki = load_config(path).wiki
+    assert wiki is not None and wiki.api_url == "https://wiki.example/w/api.php"
+    for bad in ("http://wiki.example/api.php", "https://wiki.example/", "api.php"):
+        path.write_text(base + f"wiki:\n  api_url: {bad}\n")
+        with pytest.raises(ConfigError, match="wiki.api_url"):
+            load_config(path)
+
+
+def test_canon_without_wiki_logs_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = _config(tmp_path, "guidance.md")
+    path.write_text(path.read_text() + "canon: Made-Up Saga\n")
+    load_config(path)
+    assert "canon has no effect without a wiki" in caplog.text

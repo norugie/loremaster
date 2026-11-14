@@ -43,6 +43,7 @@ from loremaster.config import DEFAULT_MIN_SCORE, ConfigError, load_config
 from loremaster.index import IndexStore, OllamaEmbedder
 from loremaster.retrieve import DEFAULT_TOP_K, Hit, Retriever
 from loremaster.vault import FrontmatterError, split_frontmatter
+from loremaster.wiki import Wiki, WikiError, make_wiki
 
 log = logging.getLogger(__name__)
 
@@ -63,20 +64,22 @@ Rules:
 - If the notes do not answer the question, say you couldn't find it in the lore.
 - Answer directly in a few sentences of plain text. Do not mention note numbers."""
 
-# Used only when no note is relevant and the config names a canon.
-# "{canon}" is replaced with the config's canon name.
-CANON_RULES = """\
-You answer questions about a roleplay setting based on {canon}, for members \
-of a Discord server. The setting's own notes say nothing about this question, \
-so answer from your knowledge of the official {canon} canon.
+# Used only when no note is relevant and wiki sections are. "{canon}" is
+# replaced with the config's canon name, or `DEFAULT_CANON`.
+WIKI_RULES = """\
+You answer questions about a roleplay setting for members of a Discord server. \
+The setting's own notes say nothing about this question, so you are given \
+excerpts from a wiki about {canon}.
 Rules:
-- State only things you are confident are official {canon} canon. Do not guess \
-or invent names, events or details.
-- If you don't know, or the question isn't about {canon}, say you don't know.
-- Answer directly in a few sentences of plain text."""
+- Use only facts stated in the excerpts. Do not add facts from your own knowledge.
+- If the excerpts do not answer the question, say you couldn't find it.
+- Answer directly in a few sentences of plain text. Do not mention excerpt numbers."""
+DEFAULT_CANON = "the setting's source material"
 
-# Reply when no note is relevant enough; the model isn't called.
+# Reply when nothing is relevant enough; the model isn't called.
 NOT_FOUND_TEXT = "I couldn't find anything about that in the lore."
+# Added to it when the wiki couldn't be asked.
+WIKI_DOWN_TEXT = " The wiki couldn't be reached either."
 
 Message = Mapping[str, str]
 
@@ -142,6 +145,10 @@ class Answer:
     # False when no note was relevant enough, so the answer isn't from the notes.
     found: bool = True
     top_score: float | None = None  # best similarity retrieved, relevant or not
+    # For an answer from the wiki: (page title, page URL) of each page used,
+    # and the credit line, e.g. "Some Wiki (CC BY-SA)".
+    sources: tuple[tuple[str, str], ...] = ()
+    credit: str = ""
 
 
 def load_guidance(vault: Path, note: Path | None) -> str:
@@ -181,28 +188,23 @@ def select_hits(hits: Sequence[Hit], budget: int = NOTES_CHAR_BUDGET) -> list[Hi
 
 
 def build_messages(
-    question: str, hits: Sequence[Hit], guidance: str = ""
+    question: str,
+    hits: Sequence[Hit],
+    guidance: str = "",
+    rules: str = SYSTEM_RULES,
+    source: str = "Notes",
 ) -> list[dict[str, str]]:
-    """The chat messages for one question. Pure: same input, same prompt."""
-    system = SYSTEM_RULES
+    """The chat messages for one question. Pure: same input, same prompt.
+
+    For a wiki answer, `rules` is the wiki rules and `source` "Wiki excerpts".
+    """
+    system = rules
     if guidance:
         system += f"\n\nGuidance from the setting's staff:\n{guidance}"
     notes = "\n\n".join(
         f"[{i}] {hit.label}\n{hit.chunk.text}" for i, hit in enumerate(hits, start=1)
     )
-    user = f"Notes:\n\n{notes}\n\nQuestion: {question.strip()}"
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-
-def build_canon_messages(
-    question: str, canon: str, guidance: str = ""
-) -> list[dict[str, str]]:
-    """The chat messages for a canon-fallback answer: no notes, the guidance
-    note still included."""
-    system = CANON_RULES.format(canon=canon)
-    if guidance:
-        system += f"\n\nGuidance from the setting's staff:\n{guidance}"
-    user = f"Question: {question.strip()}"
+    user = f"{source}:\n\n{notes}\n\nQuestion: {question.strip()}"
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -226,13 +228,15 @@ class Answerer:
         top_k: int = DEFAULT_TOP_K,
         min_score: float = DEFAULT_MIN_SCORE,
         canon: str | None = None,
+        wiki: Wiki | None = None,
     ) -> None:
         self.retriever = retriever
         self.model = model
         self.guidance = guidance
         self.top_k = top_k
         self.min_score = min_score
-        self.canon = canon  # None: vault only
+        self.canon = canon  # only words the wiki prompt
+        self.wiki = wiki  # None: vault only
 
     def retrieve(self, question: str) -> list[Hit]:
         return self.retriever.search(question, self.top_k)
@@ -246,11 +250,12 @@ class Answerer:
     def answer(self, question: str, hits: Sequence[Hit] | None = None) -> Answer:
         """Answer `question` from `hits` (retrieved here if not given).
 
-        Hits scoring below `min_score` are dropped. If none is left: with a
-        canon configured, the model answers from its canon knowledge, listing no
-        notes; without one, the reply is `NOT_FOUND_TEXT` and the
-        model is not called. Relevant notes always win over canon
-: the canon prompt is only used when there are none.
+        Hits scoring below `min_score` are dropped. If none is left and a wiki
+        is configured, the model answers from the wiki's relevant sections,
+        crediting the pages. With no wiki, nothing relevant on it, or the
+        wiki out of reach, the reply is `NOT_FOUND_TEXT` and the model is not
+        called: it never answers from its own knowledge. Relevant notes
+        always win: the wiki is only asked when there are none.
         """
         start = time.perf_counter()
         if hits is None:
@@ -258,18 +263,44 @@ class Answerer:
         top_score = hits[0].score if hits else None
         relevant = relevant_hits(hits, self.min_score)
         if not relevant:
-            if self.canon:
-                messages = build_canon_messages(question, self.canon, self.guidance)
-                text = self.model.chat(messages)
-            else:
-                text = NOT_FOUND_TEXT
+            text = NOT_FOUND_TEXT
+            chosen: list[Hit] = []
+            sources: tuple[tuple[str, str], ...] = ()
+            credit = ""
+            if self.wiki is not None:
+                try:
+                    result = self.wiki.search(question)
+                except WikiError as e:
+                    log.warning("wiki lookup failed: %s", e)
+                    text += WIKI_DOWN_TEXT
+                else:
+                    # A page the question names is relevant whatever it scores.
+                    chosen = self.select(
+                        [
+                            h
+                            for h in result.hits
+                            if h.score >= self.min_score
+                            or h.chunk.title in result.named
+                        ]
+                    )
+                    sources = tuple((t, result.urls[t]) for t in note_names(chosen))
+                    credit = result.credit
+            if chosen:
+                rules = WIKI_RULES.format(canon=self.canon or DEFAULT_CANON)
+                text = self.model.chat(
+                    build_messages(
+                        question, chosen, self.guidance, rules, "Wiki excerpts"
+                    )
+                )
             return Answer(
                 text=text,
                 notes=(),
-                hits=(),
+                hits=tuple(chosen),
                 seconds=time.perf_counter() - start,
                 found=False,
                 top_score=top_score,
+                sources=sources,
+                credit=credit,
             )
         chosen = self.select(relevant)
         text = self.model.chat(build_messages(question, chosen, self.guidance))
@@ -280,6 +311,22 @@ class Answerer:
             seconds=time.perf_counter() - start,
             top_score=top_score,
         )
+
+
+class _PrintingChat:
+    """Prints each prompt before passing it on (`--prompt`)."""
+
+    def __init__(self, inner: ChatModel) -> None:
+        self._inner = inner
+
+    @property
+    def model(self) -> str:
+        return self._inner.model
+
+    def chat(self, messages: Sequence[Message]) -> str:
+        for m in messages:
+            print(f"--- {m['role']} ---\n{m['content']}\n")
+        return self._inner.chat(messages)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -304,30 +351,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no index at {config.index_path}; build one first", file=sys.stderr)
         return 1
     embedder = OllamaEmbedder(config.models.embedding)
+    chat = OllamaChat(config.models.answer)
     with IndexStore(config.index_path, None) as store:
         answerer = Answerer(
             Retriever(store, embedder, config.models.query_prefix),
-            OllamaChat(config.models.answer),
+            _PrintingChat(chat) if args.prompt else chat,
             load_guidance(config.vault_path, config.guidance_note),
             min_score=config.retrieval.min_score,
             canon=config.canon,
+            wiki=make_wiki(config, embedder),
         )
         hits = answerer.retrieve(args.question)
-        if args.prompt:
-            relevant = relevant_hits(hits, answerer.min_score)
-            if relevant or not answerer.canon:
-                messages = build_messages(
-                    args.question, answerer.select(relevant), answerer.guidance
-                )
-            else:
-                messages = build_canon_messages(
-                    args.question, answerer.canon, answerer.guidance
-                )
-            for m in messages:
-                print(f"--- {m['role']} ---\n{m['content']}\n")
         result = answerer.answer(args.question, hits)
     print(result.text)
     print(f"\nNotes: {', '.join(result.notes) or '(none)'}")
+    for title, url in result.sources:
+        print(f"From {result.credit}: {title} <{url}>")
     scores = ", ".join(f"{h.score:.2f}" for h in hits)
     print(f"({result.seconds:.1f}s; scores {scores})")
     return 0
