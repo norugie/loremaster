@@ -1,0 +1,22 @@
+# secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# graphify output (generated)
+graphify-out/
+
+# tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# generated index (see ARCHITECTURE.md §5)
+data/
+
+# local vault config (points at a real vault); see lorebot.example.yaml
+lorebot.yaml

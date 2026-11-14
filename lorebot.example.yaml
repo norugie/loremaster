@@ -1,0 +1,66 @@
+# Example Loremaster config. Copy it next to your vault (or anywhere),
+# name it lorebot.yaml, and fill in your own values.
+# Relative paths are relative to this file's folder.
+
+# Folder of the Obsidian vault to answer from. When running in Docker, the
+# vault is mounted at /vault (set VAULT_PATH in .env), so use /vault here.
+vault_path: path/to/your/vault
+
+# Which notes the bot may use, by frontmatter. A note is used only if,
+# for every field below, its value is one of the listed values.
+include:
+  scope: [setting, rules]
+  status: [approved]
+
+# Optional: a note (path inside the vault) added to every answer prompt.
+guidance_note: guidance.md
+
+# Optional Discord settings. No server IDs are needed: the bot works in every
+# server it is invited to. Channel and role IDs are unique across all servers,
+# so one list of each covers them all. To copy an ID, turn on Developer Mode
+# in Discord, then right-click a channel or role and choose "Copy ID".
+discord:
+  # Channels the bot may answer in. Leave empty ([]) to allow any channel.
+  allowed_channel_ids: [222222222222222222]
+  # Roles allowed to use /lore update. Leave empty ([]) to turn it off.
+  staff_role_ids: [333333333333333333]
+
+# Optional: Ollama models (these are the defaults). The prefixes are put before
+# notes and questions when embedding them; these are the ones nomic-embed-text
+# expects. Use "" if your embedding model needs none.
+models:
+  answer: qwen3:4b-instruct-2507-q4_K_M
+  embedding: nomic-embed-text
+  document_prefix: "search_document: "
+  query_prefix: "search_query: "
+
+# Optional: where the search index is stored (generated; safe to delete).
+# It must be outside the vault. If not set, it goes in data/index.sqlite under
+# the folder the bot is started from.
+# index_path: ../loremaster-data/index.sqlite
+
+# Optional: how similar (0 to 1) a note must be to a question to count as
+# relevant. Below this, notes are left out, and if none is left the bot says
+# it couldn't find the answer in the lore. 0.70 suits nomic-embed-text; another
+# embedding model may need a different value.
+retrieval:
+  min_score: 0.70
+
+# Optional: the franchise your setting is based on. When set, and no note is
+# relevant to a question, the bot answers from the answer model's own knowledge
+# of that canon (listing no notes). Your notes always win when they cover the
+# question. Leave it out to answer from your notes only. Small models know
+# little canon and can get it wrong.
+# canon: Name of the franchise
+
+# Optional: /lore update, a staff command that adds or changes lore in the
+# vault. Off unless enabled. Turning it on also needs the vault mounted
+# writable: set VAULT_MODE=rw in .env. Only roles in discord.staff_role_ids can
+# use it, and every change is shown as a preview to confirm first.
+# update:
+#   enabled: true
+#   related_min_score: 0.73   # best match at or above this: update that note
+#   inbox_folder: Inbox       # new notes go here, inside the vault
+#   backup_path: data/backups # originals are copied here before an edit
+#   new_note_frontmatter:     # if not set: matches the include filter above
+#     status: draft

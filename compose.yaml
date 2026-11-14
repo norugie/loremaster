@@ -1,0 +1,43 @@
+# Run everything in a container:
+#   docker compose up -d bot                      # start the Discord bot (stays running)
+#   docker compose logs -f bot                    # follow the bot's log
+#   docker compose stop bot                       # stop it
+#   docker compose run --rm app pytest            # tests (add -m integration for Ollama tests)
+#   docker compose run --rm app mypy              # type check
+#   docker compose run --rm app ruff check        # lint
+# See ARCHITECTURE.md §4 for the watcher and search commands.
+
+# Settings shared by both services (a YAML anchor, merged in with "<<:").
+x-loremaster: &loremaster
+  init: true # forwards docker stop to Python cleanly
+  working_dir: /app
+  volumes:
+    - .:/app # live code; also data/ (the index)
+    # The lore vault, read-only unless VAULT_MODE=rw (only for /lore update).
+    - ${VAULT_PATH:-./tests/fixtures/vault}:/vault:${VAULT_MODE:-ro}
+  env_file:
+    - path: .env # secrets, read at run time, never in the image
+      required: false
+  environment:
+    # Ollama runs on the Windows host (it needs the GPU).
+    OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+    # File-change events don't cross a Windows bind mount, so poll instead.
+    WATCHFILES_FORCE_POLLING: "true"
+    WATCHFILES_POLL_DELAY_MS: "300"
+
+services:
+  # One-off commands: tests, type checks, try-it scripts.
+  # Image with the test tools and uv (Dockerfile target "dev").
+  app:
+    <<: *loremaster
+    build: { context: ., target: dev }
+    image: loremaster-bot-dev
+
+  # The Discord bot: long-running, restarted if it crashes or Docker restarts.
+  # Reads lorebot.yaml from the repo folder (or LOREBOT_CONFIG from .env).
+  # Slim image: runtime dependencies only (Dockerfile target "runtime").
+  bot:
+    <<: *loremaster
+    build: { context: ., target: runtime }
+    image: loremaster-bot
+    restart: unless-stopped
