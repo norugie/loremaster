@@ -75,7 +75,7 @@ Type `/lore ask` and your question in any channel the bot can see. The reply is 
 | `/lore ask question:` | Ask anything about the lore. Each question is answered on its own: the bot doesn't remember earlier ones. |
 | `/lore update lore:` | Staff only, off by default. Add or change lore in the vault from Discord, after a preview you confirm. |
 
-- If no note is close enough to the question, the bot says it couldn't find it in the lore. If you set a `canon` in the config, it answers from the model's own knowledge of that franchise instead, without listing notes.
+- If no note is close enough to the question, the bot says it couldn't find it in the lore. If you set a `wiki` in the config, it first searches that wiki and answers from the pages it finds, marked "Not in the server lore" with links to them. It never answers from the model's own memory.
 - After a question, the same Discord server has to wait 15 seconds before the next one. Whoever asks too soon sees how long is left (only they see it). Other servers aren't affected.
 - The bot doesn't answer in direct messages, or in channels left off `allowed_channel_ids` if you set it.
 - Edit the vault in Obsidian as usual. The bot notices saved changes within a second or so and uses them for the next question; no restart needed.
@@ -122,6 +122,9 @@ include:                           # which notes the bot may use
 
 guidance_note: Meta/bot-guidance.md
 
+wiki:
+  api_url: https://starfall.example.org/api.php
+
 canon: The Starfall Chronicles
 
 discord:
@@ -153,7 +156,8 @@ index_path: data/index.sqlite
 | `vault_path` | yes | Folder of the vault. With Docker this is `/vault` (or `.` when the config file sits in the vault). Relative paths count from the config file's folder. |
 | `include` | yes | Which notes the bot may read, by frontmatter. Each key is a frontmatter field and lists the allowed values. A note is used only if **every** listed field matches; when the note's value is a list (like tags), one allowed item is enough. Values are compared exactly (case matters). Notes without frontmatter are skipped, as are folders and files starting with `.`. |
 | `guidance_note` | no | A note (path inside the vault) added to every answer prompt: house rules for answering, such as "server lore overrides canon" or "call the city by its full name". Keep it short. The bot won't start if the note doesn't exist. Edits apply without a restart. |
-| `canon` | no | The franchise your setting is based on. When set and no note is relevant, the bot answers from the model's own knowledge of it. Your notes always win when they cover the question. Small models know little canon and can be wrong, so leave this out to answer from your notes only. |
+| `wiki.api_url` | no | A wiki to search when no note is relevant: the full `https://` address of its `api.php` (any MediaWiki wiki, which most fan wikis are). The bot reads the three best-matching pages, answers only from their text, and credits the wiki with links. If the wiki has nothing relevant or can't be reached, the bot says it couldn't find it. Your notes always win when they cover the question. Each new question costs the wiki up to four requests; pages are remembered for a day. Check that the wiki's terms allow automated requests before you turn this on. |
+| `canon` | no | The franchise your setting is based on. Only used to tell the model what the wiki is about; it does nothing without `wiki`. |
 | `discord.allowed_channel_ids` | no | Channels where the bot answers. Empty or missing: any channel it can see. Channel IDs are unique across Discord, so one list covers every server. |
 | `discord.staff_role_ids` | no | Roles allowed to use `/lore update`. Empty or missing: nobody. |
 | `models.answer` | no | The Ollama model that writes answers. Default `qwen3:4b-instruct-2507-q4_K_M`. |
@@ -233,10 +237,11 @@ docker compose run --rm app mypy                    # type check (strict)
 docker compose run --rm app ruff check              # lint
 docker compose run --rm app python -m loremaster.retrieve "a question"   # see what search finds
 docker compose run --rm app python -m loremaster.answer "a question"     # answer without Discord
+docker compose run --rm app python -m loremaster.wiki "a question"       # see what the wiki search finds
 docker compose run --rm app python -m loremaster.watcher                 # build or refresh the index
 ```
 
-The last three read the same `lorebot.yaml` as the bot. The watcher builds the index without starting the bot (no Discord token needed): press Ctrl+C after its first `index sync` line.
+The last four read the same `lorebot.yaml` as the bot. The watcher builds the index without starting the bot (no Discord token needed): press Ctrl+C after its first `index sync` line.
 
 How it's built: see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -256,6 +261,6 @@ Each measurement had a target set beforehand. Measured on 12 November 2026 on an
 | `/lore update`: right note / new lore included / rest of the note intact | 0.90 / 0.90 / 1.00 or better | 0.90 / 1.00 / 1.00 (10 submissions) |
 
 - Questions with no relevant note are answered in 0.0 s, because the model isn't called. That pulls the median down.
-- Server-over-canon answers (target 0.80) have no questions yet, and canon accuracy is tracked without a target while canon fallback is off.
+- Server-over-canon answers (target 0.80) have no questions yet. The wiki fallback was added after these measurements and isn't covered by them.
 
 How it was measured: eval scripts ran the question files through the real search and models; GPU memory was sampled with `nvidia-smi` every 200 ms during a full run. The scripts were removed once the targets were met, so they are not in this repo.

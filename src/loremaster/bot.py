@@ -54,6 +54,7 @@ from loremaster.index import IndexSettings, IndexStore, OllamaEmbedder, SyncStat
 from loremaster.retrieve import Hit, Retriever
 from loremaster.update import Change, UpdateError, Updater
 from loremaster.watcher import VaultSyncer, watch_vault
+from loremaster.wiki import make_wiki
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +105,13 @@ def format_reply(
     asked = " ".join(question.split())  # one line, so the quote stays one block
     header = f"> {asked}\n" if asked else ""
     footer = f"\n-# Notes: {', '.join(answer.notes)}" if answer.notes else ""
+    if answer.sources:
+        # <url>: angle brackets stop Discord from adding a link preview.
+        links = ", ".join(
+            f"[{title.replace('[', r'\[').replace(']', r'\]')}](<{url}>)"
+            for title, url in answer.sources
+        )
+        footer = f"\n-# Not in the server lore. From {answer.credit}: {links}"
     room = limit - len(header) - len(footer)
     if len(footer) > limit // 2:  # absurdly many notes: keep the answer readable
         footer = footer[: limit // 2 - 1] + "…"
@@ -572,6 +580,7 @@ class LoreBot(discord.Client):
             load_guidance(config.vault_path, config.guidance_note),
             min_score=config.retrieval.min_score,
             canon=config.canon,
+            wiki=make_wiki(config, embedder),
         )
         updater = None
         if config.update.enabled:

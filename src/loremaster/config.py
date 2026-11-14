@@ -6,6 +6,7 @@ startup; anything missing or invalid raises `ConfigError` with a message naming
 the bad value.
 """
 
+import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
@@ -27,6 +28,8 @@ DEFAULT_MIN_SCORE = 0.70
 # an existing note. Measured on 10 test submissions.
 DEFAULT_RELATED_MIN_SCORE = 0.73  # lowered from 0.75 after the first measurement
 DEFAULT_BACKUP_PATH = Path("data/backups")
+
+log = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -89,6 +92,13 @@ class UpdateConfig(_Strict):
     new_note_frontmatter: dict[str, str | list[str]] | None = None
 
 
+class WikiConfig(_Strict):
+    """A MediaWiki wiki searched when no note is relevant to a question."""
+
+    # Full address of the wiki's api.php. The bot only ever requests this URL.
+    api_url: str = Field(pattern=r"^https://[^\s/?#]+(/[^\s?#]*)?/api\.php$")
+
+
 class Config(_Strict):
     """The validated contents of `lorebot.yaml`."""
 
@@ -99,10 +109,12 @@ class Config(_Strict):
     include: dict[str, Annotated[list[str], Field(min_length=1)]] = Field(min_length=1)
     # Path of the guidance note, relative to the vault. Optional.
     guidance_note: Path | None = None
-    # The franchise the setting is based on (e.g. a game series). When set, the
-    # bot falls back to the answer model's own knowledge of it if no note is
-    # relevant. When not set, it answers from the vault only.
+    # The franchise the setting is based on (e.g. a game series). Only used to
+    # word the prompt for wiki answers; it has no effect without `wiki`.
     canon: str | None = Field(default=None, min_length=1)
+    # When set, questions no note is relevant to are answered from this wiki.
+    # When not set, the bot answers from the vault only.
+    wiki: WikiConfig | None = None
     discord: DiscordConfig = DiscordConfig()
     models: ModelsConfig = ModelsConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
@@ -148,6 +160,8 @@ def load_config(path: Path) -> Config:
     )
     if not config.vault_path.is_dir():
         raise ConfigError(f"{path}: vault_path: folder not found: {config.vault_path}")
+    if config.canon and config.wiki is None:
+        log.warning("%s: canon has no effect without a wiki block", path)
     if config.index_path.is_relative_to(config.vault_path):
         raise ConfigError(
             f"{path}: index_path: must be outside the vault: {config.index_path}"
